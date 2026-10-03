@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -13,6 +14,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from .backends import Backend, build_backend
 from .config import Settings
 from .models import ChatCompletionRequest, ChatMessage, ResponsesRequest
+from .content import MAX_IMAGES, MAX_REQUEST_BYTES
 from .security import redact_secret
 
 
@@ -35,6 +37,27 @@ def _require_auth(settings: Settings):
 
 def _truthy_header(value: str | None) -> bool:
     return bool(value and value.strip().lower() in {"1", "true", "yes", "on"})
+
+
+def _resolve_new_session(body_value: bool | None, header_value: str | None) -> bool | None:
+    if body_value is not None:
+        return body_value
+    if header_value is not None:
+        return _truthy_header(header_value)
+    return None
+
+
+def _validate_messages(messages):
+    if not messages:
+        raise ValueError("messages must not be empty.")
+    images = []
+    for message in messages:
+        _, attachments = message.parts()
+        if attachments and message.role != "user":
+            raise ValueError("Only user messages may contain images.")
+        images.extend(attachments)
+    if len(images) > MAX_IMAGES or sum(len(image.data) for image in images) > MAX_REQUEST_BYTES:
+        raise ValueError("A request supports at most 10 images and 32 MiB total.")
 
 
 def _request_level(req) -> str | None:
@@ -100,6 +123,10 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
     app.state.settings = settings
     app.state.backend = backend
 
+    @app.exception_handler(ValueError)
+    async def invalid_request(_: Request, exc: ValueError):
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request_error"}})
+
     @app.exception_handler(Exception)
     async def unhandled(_: Request, exc: Exception):
         return JSONResponse(status_code=500, content={"error": {"message": redact_secret(str(exc)), "type": exc.__class__.__name__}})
@@ -144,6 +171,8 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
                 for level in settings.available_levels
             ],
             "new_session": {"body_field": "new_session", "header": "X-New-Session"},
+            "conversation": {"mode": "history_prefix", "body_field": "conversation_id"},
+            "images": {"format": "image_url with base64 data URL", "types": ["png", "jpeg", "webp", "gif"], "max_images": MAX_IMAGES},
         }
 
     @app.get("/v1/provider/status")
@@ -169,11 +198,12 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
         selected_model = req.model or settings.model_id
         selected_level = _request_level(req)
         _validate_requested_options(settings, selected_model, selected_level)
-        new_session = req.new_session or _truthy_header(x_new_session)
+        new_session = _resolve_new_session(req.new_session, x_new_session)
+        _validate_messages(req.messages)
         result = await _run_with_queue(
             settings,
             queue_sem,
-            lambda: backend.complete(req.messages, model=selected_model, new_session=new_session, level=selected_level),
+            lambda: backend.complete_request(req.messages, model=selected_model, new_session=new_session, level=selected_level, conversation_id=req.conversation_id, scope=hashlib.sha256(_token.encode()).hexdigest()),
         )
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         usage = {
@@ -185,11 +215,12 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
             return StreamingResponse(
                 _chat_completion_stream(response_id, started, result.model, result.text, usage),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **({"X-Conversation-Id": result.conversation_id} if result.conversation_id else {})},
             )
         return {
             "id": response_id,
             "object": "chat.completion",
+            "conversation_id": result.conversation_id,
             "created": started,
             "model": result.model,
             "level": result.level,
@@ -204,20 +235,22 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
         if req.stream:
             raise HTTPException(status_code=501, detail="streaming is not implemented yet")
         messages = _responses_input_to_messages(req.input)
+        _validate_messages(messages)
         started = int(time.time())
         selected_model = req.model or settings.model_id
         selected_level = _request_level(req)
         _validate_requested_options(settings, selected_model, selected_level)
-        new_session = req.new_session or _truthy_header(x_new_session)
+        new_session = _resolve_new_session(req.new_session, x_new_session)
         result = await _run_with_queue(
             settings,
             queue_sem,
-            lambda: backend.complete(messages, model=selected_model, new_session=new_session, level=selected_level),
+            lambda: backend.complete_request(messages, model=selected_model, new_session=new_session, level=selected_level, conversation_id=req.conversation_id, scope=hashlib.sha256(_token.encode()).hexdigest()),
         )
         response_id = f"resp_{uuid.uuid4().hex}"
         return {
             "id": response_id,
             "object": "response",
+            "conversation_id": result.conversation_id,
             "created_at": started,
             "status": "completed",
             "model": result.model,
@@ -249,11 +282,9 @@ def _responses_input_to_messages(value: str | list | dict) -> list[ChatMessage]:
         for item in value:
             if isinstance(item, dict) and "role" in item:
                 content = item.get("content", "")
-                if isinstance(content, list):
-                    content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
                 messages.append(ChatMessage(role=str(item.get("role", "user")), content=content))
-        return messages or [ChatMessage(role="user", content=str(value))]
-    return [ChatMessage(role="user", content=str(value))]
+        return messages or [ChatMessage(role="user", content=value)]
+    return [ChatMessage(role="user", content=value)]
 
 
 def main() -> None:

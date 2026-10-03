@@ -1,5 +1,7 @@
 # chatgpt-web-provider
 
+本机修改版的 Windows 启动方式、连续对话和图片支持见 [WINDOWS-LOCAL.md](WINDOWS-LOCAL.md)。下方为上游说明；会话默认行为以本机说明为准。
+
 OpenAI-compatible API facade for a browser-controlled `chatgpt.com` worker.
 
 This project is designed for personal/internal use: third-party tools call a normal

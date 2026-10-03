@@ -16,6 +16,7 @@ def main() -> None:
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             settings.profile_dir,
+            channel="chrome",
             headless=False,
             viewport={"width": 1400, "height": 1000},
             args=["--disable-blink-features=AutomationControlled"],
